@@ -12,6 +12,8 @@ import os
 import logging
 import logging.handlers
 import sys
+import socket
+from subprocess import call
 
 LOG_FILENAME = "/tmp/radio.log"
 LOG_LEVEL = logging.INFO
@@ -33,7 +35,8 @@ OFF_MENU = 1
 VOLUME_MENU = 2
 ALARM_MENU = 3
 SHUTDOWN_MENU = 4
-MAX_MENU = 4
+REBOOT_MENU = 5
+MAX_MENU = 5
 
 # Digital pins
 BUZZER_PIN = 6
@@ -50,6 +53,8 @@ TEMPERATURE_TOPIC = '/house/rooms/second-floor/master-bedroom/temperature'
 LIGHT_TOPIC = '/house/rooms/second-floor/master-bedroom/light-level'
 PUBLISH_PERIODS = 10
 
+color = 0x770077
+
 # Working data
 display = 0
 subMenu = 0
@@ -60,6 +65,7 @@ period = PUBLISH_PERIODS
 menu = False
 radio = False
 playlist = 0
+playlists = None
 subMenuSelected = False
 playing = False
 volume = 8
@@ -113,13 +119,13 @@ else:
     bus = smbus.SMBus(0)
 
 # set backlight to (R,G,B) (values from 0..255 for each)
-def setRGB(r,g,b):
+def setRGB(c):
     bus.write_byte_data(DISPLAY_RGB_ADDR,0,0)
     bus.write_byte_data(DISPLAY_RGB_ADDR,1,0)
     bus.write_byte_data(DISPLAY_RGB_ADDR,0x08,0xaa)
-    bus.write_byte_data(DISPLAY_RGB_ADDR,4,r)
-    bus.write_byte_data(DISPLAY_RGB_ADDR,3,g)
-    bus.write_byte_data(DISPLAY_RGB_ADDR,2,b)
+    bus.write_byte_data(DISPLAY_RGB_ADDR,4,(c >> 16) & 0xff)
+    bus.write_byte_data(DISPLAY_RGB_ADDR,3,(c >> 8) & 0xff)
+    bus.write_byte_data(DISPLAY_RGB_ADDR,2,c & 0xff)
 
 # send command to display (no need for external use)
 def textCommand(cmd):
@@ -154,6 +160,11 @@ def on_connect(client, userdata, flags, rc):
 # The callback for when a PUBLISH message is received from the server.
 def on_message(client, userdata, msg):
     print(msg.topic+" "+str(msg.payload))
+    
+def on_disconnect(client, userdata, rc):
+    connected = False
+    if rc != 0:
+        print("Unexpected disconnection.")
 
 def buzz():
     grovepi.digitalWrite(BUZZER_PIN,1)
@@ -200,15 +211,32 @@ def read_buttons():
 client = mqtt.Client()
 client.on_connect = on_connect
 client.on_message = on_message
-client.connect("192.168.0.101", 1883, 60)
+client.on_disconnect = on_disconnect
+client.loop_start()
 
-mpc = MPDClient()
-mpc.timeout = 10
-mpc.connect("localhost", 6600)
-mpc.setvol(volume*10)
-playlists = mpc.listplaylists()
+try:
+	client.connect("192.168.0.101", 1883, 60)
+	
+except socket.error:
+	print "Failed to connect to mqtt"	
 
-print playlists
+while True:
+    try:
+	    mpc = MPDClient()
+	    mpc.timeout = 10
+
+	    mpc.connect("localhost", 6600)
+	    mpc.setvol(volume*10)
+	    playlists = mpc.listplaylists()
+	    print playlists
+	    break
+    except socket.error:
+	    print "Failed to connect to mpd"
+	    setText("mpc failure")
+	    button = 0
+	    while not button:
+	        button = read_buttons()
+	    setText("Retrying ...")  
 
 # Main loop
 while True:
@@ -222,6 +250,8 @@ while True:
         # Scroll through  displays or menus, or submenu items         
         if button == 1:
             #print 'Button 1 pressed'
+            #call(["espeak","-s140 -ven+18 -z","Button 1 pressed"])
+            
             if not(menu):
                 display += 1
                 if display > MAX_DISPLAY:
@@ -234,7 +264,7 @@ while True:
                             volume = 0
                     elif subMenu == RADIO_MENU:
                         playlist += 1
-                        if playlist == len(playlists):
+                        if playlists != None and playlist == len(playlists):
                             playlist = 0
                     elif subMenu == ALARM_MENU:
                         hours += 1
@@ -251,10 +281,18 @@ while True:
                 buzzing = False
             elif subMenuSelected:
                 if subMenu == RADIO_MENU:
-                    mpc.clear()
-                    mpc.load(playlists[playlist]['playlist'])
-                    mpc.play()
-                    playing = True
+                    if playlists != None:
+                        try:
+                            setText("clear")
+                            mpc.clear()
+                            setText("load")
+                            mpc.load(playlists[playlist]['playlist'])
+                            setText("play")
+                            mpc.play()
+                            playing = True
+                        except:
+                            e = sys.exc_info()[0]
+                            print "Exception in play ", e
                     display = RADIO_DISPLAY
                 elif subMenu == VOLUME_MENU:
                     mpc.setvol(volume*10)
@@ -302,16 +340,15 @@ while True:
 	        os.system("./netcheck")
 	        
 	        # Publish sensor data
-	        client.loop();
 	        client.publish(TEMPERATURE_TOPIC,str(temp*10));
 	        client.publish(LIGHT_TOPIC,str(light));
 
         #print "Backlight is " + str(backLight)
         # Set the backlight
         if backLight:
-            setRGB(0,255,0)
+            setRGB(color)
         else:
-            setRGB(0,0,0)
+            setRGB(0)
             
         #print "Display is " + str(display)
         # Display data
@@ -326,7 +363,8 @@ while True:
                 setText("Turn radio off")
             elif subMenu == RADIO_MENU:
                 if subMenuSelected:
-                    setText(playlists[playlist]["playlist"])
+                    if playlists != None:
+                        setText(playlists[playlist]["playlist"])
                 else:
                     setText("Choose radio\nstation") 
             elif subMenu == ALARM_MENU:
@@ -337,17 +375,28 @@ while True:
             elif subMenu == SHUTDOWN_MENU:
                 if subMenuSelected:
                     setText("Shutting down")
-                    setRGB(0,0,0)
+                    setRGB(0)
                     os.system("sudo poweroff")
                 else:
                     setText("Shutdown the rPi")
+            elif subMenu == REBOOT_MENU:
+                if subMenuSelected:
+                    setText("Rebooting")
+                    setRGB(0)
+                    os.system("sudo reboot")
+                else:
+                    setText("Reboot the rPi")                    
         else:
 	        if display == CLOCK_DISPLAY:
-	            setText(datetime.now().strftime("%d %B %Y") + "\n" + datetime.now().strftime("%I:%M%p"))
+	            setText(datetime.now().strftime("%a %d %b %Y") + "\n" + datetime.now().strftime("%I:%M %p"))
 	        elif display == SENSOR_DISPLAY:
-	            setText("Temp  = {:.2f}".format(temp) + "\n" + "Light = " + str(light)) 
+	            setText("T: {:.2f}".format(temp) + " L: " + str(light) + "\nS: " + str(sound)) 
 	        elif display == MENU_DISPLAY:
-	            setText("Main Menu")
+	            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); 
+	            s.connect(('8.8.8.8', 80)); 
+	            ip = s.getsockname()[0]; 
+	            s.close()
+	            setText("Main Menu\n" + ip)
 	        elif display == RADIO_DISPLAY:
 	            if playing:
 	                currentSong = mpc.currentsong()
@@ -370,7 +419,7 @@ while True:
 	            if alarmSet:
 	                setText("Alarm: " + str(hours) + ":" + str(minutes))
 	            else:
-	                setText("Alarm not set")
+	                setText("Alarm not set\nconnected: " + str(connected))
             
         # Deal with alarm
         if (buzzing):
@@ -390,3 +439,5 @@ while True:
         break
     except IOError:
         print "I/O Error"
+    except socket.error:
+        print "Socket test"
